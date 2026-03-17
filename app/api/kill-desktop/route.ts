@@ -1,3 +1,4 @@
+// 销毁指定的远程沙箱桌面
 import { killDesktop } from "@/lib/sandbox/utils";
 
 // Common handler for both GET and POST requests

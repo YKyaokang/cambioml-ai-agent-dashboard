@@ -99,6 +99,7 @@ export default function Chat() {
   };
 
   // Kill desktop on page close
+  // 何时触发关闭该沙箱远程桌面
   useEffect(() => {
     if (!sandboxId) return;
 
