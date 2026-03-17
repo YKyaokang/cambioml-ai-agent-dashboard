@@ -1,313 +1,239 @@
 "use client";
 
-import { PreviewMessage } from "@/components/message";
-import { getDesktopURL } from "@/lib/sandbox/utils";
-import { useScrollToBottom } from "@/lib/use-scroll-to-bottom";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useChat } from "@ai-sdk/react";
-import { useEffect, useState } from "react";
-import { Input } from "@/components/input";
-import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
-import { DeployButton, ProjectInfo } from "@/components/project-info";
-import { AISDKLogo } from "@/components/icons";
-import { PromptSuggestions } from "@/components/prompt-suggestions";
+import equal from "fast-deep-equal";
 import {
   ResizableHandle,
   ResizablePanel,
   ResizablePanelGroup,
 } from "@/components/ui/resizable";
+import { Button } from "@/components/ui/button";
+import { PreviewMessage } from "@/components/message";
+import { Input } from "@/components/input";
+import { VncPanel } from "@/components/vnc-panel";
+import { SessionSidebar } from "@/components/session-sidebar";
+import { DebugPanel } from "@/components/debug-panel";
+import { ToolCallDetail } from "@/components/tool-call-detail";
+import { AISDKLogo } from "@/components/icons";
+import { DeployButton, ProjectInfo } from "@/components/project-info";
+import { PromptSuggestions } from "@/components/prompt-suggestions";
+import { getDesktopURL } from "@/lib/sandbox/utils";
+import { useScrollToBottom } from "@/lib/use-scroll-to-bottom";
+import { useSessions } from "@/lib/use-sessions";
+import {
+  EventStoreProvider,
+  useEventStore,
+  type ToolEvent,
+  type ComputerAction,
+} from "@/lib/event-store";
 import { ABORTED } from "@/lib/utils";
+import { Bug, PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import type { Message } from "ai";
 
-export default function Chat() {
-  // Create separate refs for mobile and desktop to ensure both scroll properly
-  const [desktopContainerRef, desktopEndRef] = useScrollToBottom();
-  const [mobileContainerRef, mobileEndRef] = useScrollToBottom();
+function Dashboard() {
+  const { addEvent, updateEvent, clearEvents } = useEventStore();
+  const {
+    sessions,
+    activeSession,
+    createNewSession,
+    switchSession,
+    deleteSession,
+    updateActiveSessionMessages,
+    updateActiveSessionSandboxId,
+    renameSession,
+  } = useSessions();
 
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [debugOpen, setDebugOpen] = useState(false);
+  // setSelectedEvent is used when session changes; tool-call clicks can wire it in future
+  const [selectedEvent, setSelectedEvent] = useState<ToolEvent | null>(null); // eslint-disable-line @typescript-eslint/no-unused-vars
   const [isInitializing, setIsInitializing] = useState(true);
   const [streamUrl, setStreamUrl] = useState<string | null>(null);
-  const [sandboxId, setSandboxId] = useState<string | null>(null);
+  const sandboxIdRef = useRef<string | null>(activeSession.sandboxId);
+  sandboxIdRef.current = activeSession.sandboxId;
+  const [containerRef, endRef] = useScrollToBottom();
 
   const {
-    messages,
-    input,
-    handleInputChange,
-    handleSubmit,
-    status,
-    stop: stopGeneration,
-    append,
-    setMessages,
+    messages, input, handleInputChange, handleSubmit,
+    status, stop: stopGeneration, append, setMessages,
   } = useChat({
     api: "/api/chat",
-    id: sandboxId ?? undefined,
-    body: {
-      sandboxId,
-    },
+    id: activeSession.id,
+    body: { sandboxId: activeSession.sandboxId },
     maxSteps: 30,
+    initialMessages: activeSession.messages as Message[],
     onError: (error) => {
       console.error(error);
-      toast.error("There was an error", {
-        description: "Please try again later.",
-        richColors: true,
-        position: "top-center",
-      });
+      toast.error("There was an error", { description: "Please try again later.", richColors: true, position: "top-center" });
     },
   });
 
+  const prevMessagesRef = useRef<Message[]>([]);
+  useEffect(() => {
+    if (!equal(prevMessagesRef.current, messages)) {
+      prevMessagesRef.current = messages;
+      updateActiveSessionMessages(messages);
+    }
+  }, [messages, updateActiveSessionMessages]);
+
+  const processedPartIds = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    for (const msg of messages) {
+      if (msg.role !== "assistant") continue;
+      for (const part of msg.parts ?? []) {
+        if (part.type !== "tool-invocation") continue;
+        const inv = part.toolInvocation;
+        const partId = `${msg.id}-${inv.toolCallId}`;
+        const newStatus = inv.state === "result"
+          ? inv.result === ABORTED ? ("aborted" as const) : ("success" as const)
+          : ("running" as const);
+        if (processedPartIds.current.has(partId)) {
+          updateEvent(inv.toolCallId, { status: newStatus, ...(inv.state === "result" ? { result: inv.result as string } : {}) });
+          continue;
+        }
+        processedPartIds.current.add(partId);
+        if (inv.toolName === "computer") {
+          addEvent({ id: inv.toolCallId, timestamp: Date.now(), type: "computer", action: (inv.args as { action: ComputerAction }).action, payload: inv.args as Record<string, unknown>, status: newStatus });
+        } else if (inv.toolName === "bash") {
+          addEvent({ id: inv.toolCallId, timestamp: Date.now(), type: "bash", command: (inv.args as { command: string }).command, status: newStatus });
+        }
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages]);
+
   const stop = () => {
     stopGeneration();
-
-    const lastMessage = messages.at(-1);
-    const lastMessageLastPart = lastMessage?.parts.at(-1);
-    if (
-      lastMessage?.role === "assistant" &&
-      lastMessageLastPart?.type === "tool-invocation"
-    ) {
-      setMessages((prev) => [
-        ...prev.slice(0, -1),
-        {
-          ...lastMessage,
-          parts: [
-            ...lastMessage.parts.slice(0, -1),
-            {
-              ...lastMessageLastPart,
-              toolInvocation: {
-                ...lastMessageLastPart.toolInvocation,
-                state: "result",
-                result: ABORTED,
-              },
-            },
-          ],
-        },
-      ]);
+    const lastMsg = messages.at(-1);
+    const lastPart = lastMsg?.parts?.at(-1);
+    if (lastMsg?.role === "assistant" && lastPart?.type === "tool-invocation") {
+      setMessages((prev) => [...prev.slice(0, -1), { ...lastMsg, parts: [...lastMsg.parts.slice(0, -1), { ...lastPart, toolInvocation: { ...lastPart.toolInvocation, state: "result", result: ABORTED } }] }]);
     }
   };
 
-  const isLoading = status !== "ready";
-
-  const refreshDesktop = async () => {
+  const refreshDesktop = useCallback(async () => {
     try {
       setIsInitializing(true);
-      const { streamUrl, id } = await getDesktopURL(sandboxId || undefined);
-      // console.log("Refreshed desktop connection with ID:", id);
-      setStreamUrl(streamUrl);
-      setSandboxId(id);
-    } catch (err) {
-      console.error("Failed to refresh desktop:", err);
-    } finally {
-      setIsInitializing(false);
-    }
-  };
+      const { streamUrl: url, id } = await getDesktopURL(sandboxIdRef.current ?? undefined);
+      setStreamUrl(url);
+      updateActiveSessionSandboxId(id);
+    } catch (err) { console.error("Failed to refresh desktop:", err); }
+    finally { setIsInitializing(false); }
+  }, [updateActiveSessionSandboxId]);
 
-  // Kill desktop on page close
-  // 何时触发关闭该沙箱远程桌面
   useEffect(() => {
-    if (!sandboxId) return;
-
-    // Function to kill the desktop - just one method to reduce duplicates
-    const killDesktop = () => {
-      if (!sandboxId) return;
-
-      // Use sendBeacon which is best supported across browsers
-      navigator.sendBeacon(
-        `/api/kill-desktop?sandboxId=${encodeURIComponent(sandboxId)}`,
-      );
-    };
-
-    // Detect iOS / Safari
-    const isIOS =
-      /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-      (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    const id = sandboxIdRef.current;
+    if (!id) return;
+    const kill = () => navigator.sendBeacon(`/api/kill-desktop?sandboxId=${encodeURIComponent(id)}`);
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
     const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
-
-    // Choose exactly ONE event handler based on the browser
-    if (isIOS || isSafari) {
-      // For Safari on iOS, use pagehide which is most reliable
-      window.addEventListener("pagehide", killDesktop);
-
-      return () => {
-        window.removeEventListener("pagehide", killDesktop);
-        // Also kill desktop when component unmounts
-        killDesktop();
-      };
-    } else {
-      // For all other browsers, use beforeunload
-      window.addEventListener("beforeunload", killDesktop);
-
-      return () => {
-        window.removeEventListener("beforeunload", killDesktop);
-        // Also kill desktop when component unmounts
-        killDesktop();
-      };
-    }
-  }, [sandboxId]);
+    const killEvt = isIOS || isSafari ? "pagehide" : "beforeunload";
+    window.addEventListener(killEvt, kill);
+    return () => { window.removeEventListener(killEvt, kill); kill(); };
+  }, [activeSession.sandboxId]);
 
   useEffect(() => {
-    // Initialize desktop and get stream URL when the component mounts
-    const init = async () => {
+    (async () => {
       try {
         setIsInitializing(true);
-
-        // Use the provided ID or create a new one
-        const { streamUrl, id } = await getDesktopURL(sandboxId ?? undefined);
-
-        setStreamUrl(streamUrl);
-        setSandboxId(id);
-      } catch (err) {
-        console.error("Failed to initialize desktop:", err);
-        toast.error("Failed to initialize desktop");
-      } finally {
-        setIsInitializing(false);
-      }
-    };
-
-    init();
+        const { streamUrl: url, id } = await getDesktopURL(sandboxIdRef.current ?? undefined);
+        setStreamUrl(url); updateActiveSessionSandboxId(id);
+      } catch (err) { console.error("Failed to initialize desktop:", err); toast.error("Failed to initialize desktop"); }
+      finally { setIsInitializing(false); }
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const prevSessionId = useRef(activeSession.id);
+  useEffect(() => {
+    if (prevSessionId.current !== activeSession.id) {
+      prevSessionId.current = activeSession.id;
+      processedPartIds.current.clear();
+      clearEvents();
+      setSelectedEvent(null);
+    }
+  }, [activeSession.id, clearEvents]);
+
+  const isLoading = status !== "ready";
+
   return (
-    <div className="flex h-dvh relative">
-      {/* Mobile/tablet banner */}
-      <div className="flex items-center justify-center fixed left-1/2 -translate-x-1/2 top-5 shadow-md text-xs mx-auto rounded-lg h-8 w-fit bg-blue-600 text-white px-3 py-2 text-left z-50 xl:hidden">
-        <span>Headless mode</span>
+    <div className="flex h-dvh bg-[#080810] text-white overflow-hidden">
+      <div className={`shrink-0 transition-all duration-200 ease-in-out overflow-hidden border-r border-white/[0.05] ${sidebarOpen ? "w-48" : "w-0"}`}>
+        <SessionSidebar sessions={sessions} activeSessionId={activeSession.id} onCreateSession={createNewSession} onSwitchSession={switchSession} onDeleteSession={deleteSession} onRenameSession={renameSession} />
       </div>
-
-      {/* Resizable Panels */}
-      <div className="w-full hidden xl:block">
-        <ResizablePanelGroup direction="horizontal" className="h-full">
-          {/* Desktop Stream Panel */}
-          <ResizablePanel
-            defaultSize={70}
-            minSize={40}
-            className="bg-black relative items-center justify-center"
-          >
-            {streamUrl ? (
-              <>
-                <iframe
-                  src={streamUrl}
-                  className="w-full h-full"
-                  style={{
-                    transformOrigin: "center",
-                    width: "100%",
-                    height: "100%",
-                  }}
-                  allow="autoplay"
-                />
-                <Button
-                  onClick={refreshDesktop}
-                  className="absolute top-2 right-2 bg-black/50 hover:bg-black/70 text-white px-3 py-1 rounded text-sm z-10"
-                  disabled={isInitializing}
-                >
-                  {isInitializing ? "Creating desktop..." : "New desktop"}
-                </Button>
-              </>
-            ) : (
-              <div className="flex items-center justify-center h-full text-white">
-                {isInitializing
-                  ? "Initializing desktop..."
-                  : "Loading stream..."}
-              </div>
-            )}
-          </ResizablePanel>
-
-          <ResizableHandle withHandle />
-
-          {/* Chat Interface Panel */}
-          <ResizablePanel
-            defaultSize={30}
-            minSize={25}
-            className="flex flex-col border-l border-zinc-200"
-          >
-            <div className="bg-white py-4 px-4 flex justify-between items-center">
-              <AISDKLogo />
-              <DeployButton />
-            </div>
-
-            <div
-              className="flex-1 space-y-6 py-4 overflow-y-auto px-4"
-              ref={desktopContainerRef}
-            >
-              {messages.length === 0 ? <ProjectInfo /> : null}
-              {messages.map((message, i) => (
-                <PreviewMessage
-                  message={message}
-                  key={message.id}
-                  isLoading={isLoading}
-                  status={status}
-                  isLatestMessage={i === messages.length - 1}
-                />
-              ))}
-              <div ref={desktopEndRef} className="pb-2" />
-            </div>
-
-            {messages.length === 0 && (
-              <PromptSuggestions
-                disabled={isInitializing}
-                submitPrompt={(prompt: string) =>
-                  append({ role: "user", content: prompt })
-                }
-              />
-            )}
-            <div className="bg-white">
-              <form onSubmit={handleSubmit} className="p-4">
-                <Input
-                  handleInputChange={handleInputChange}
-                  input={input}
-                  isInitializing={isInitializing}
-                  isLoading={isLoading}
-                  status={status}
-                  stop={stop}
-                />
-              </form>
-            </div>
-          </ResizablePanel>
-        </ResizablePanelGroup>
-      </div>
-
-      {/* Mobile View (Chat Only) */}
-      <div className="w-full xl:hidden flex flex-col">
-        <div className="bg-white py-4 px-4 flex justify-between items-center">
-          <AISDKLogo />
-          <DeployButton />
-        </div>
-
-        <div
-          className="flex-1 space-y-6 py-4 overflow-y-auto px-4"
-          ref={mobileContainerRef}
-        >
-          {messages.length === 0 ? <ProjectInfo /> : null}
-          {messages.map((message, i) => (
-            <PreviewMessage
-              message={message}
-              key={message.id}
-              isLoading={isLoading}
-              status={status}
-              isLatestMessage={i === messages.length - 1}
-            />
-          ))}
-          <div ref={mobileEndRef} className="pb-2" />
-        </div>
-
-        {messages.length === 0 && (
-          <PromptSuggestions
-            disabled={isInitializing}
-            submitPrompt={(prompt: string) =>
-              append({ role: "user", content: prompt })
-            }
-          />
-        )}
-        <div className="bg-white">
-          <form onSubmit={handleSubmit} className="p-4">
-            <Input
-              handleInputChange={handleInputChange}
-              input={input}
-              isInitializing={isInitializing}
-              isLoading={isLoading}
-              status={status}
-              stop={stop}
-            />
-          </form>
+      <div className="flex flex-col flex-1 min-w-0">
+        <header className="flex items-center justify-between px-3 py-2 border-b border-white/[0.05] shrink-0 bg-[#0c0c14]">
+          <div className="flex items-center gap-2">
+            <Button size="icon" variant="ghost" onClick={() => setSidebarOpen((v) => !v)} className="w-7 h-7 text-white/40 hover:text-white/80 hover:bg-white/5 rounded-md">
+              {sidebarOpen ? <PanelLeftClose className="w-4 h-4" /> : <PanelLeftOpen className="w-4 h-4" />}
+            </Button>
+            <AISDKLogo />
+          </div>
+          <div className="flex items-center gap-2">
+            <Button size="sm" variant="ghost" onClick={() => setDebugOpen((v) => !v)}
+              className={`h-7 px-2.5 text-xs gap-1.5 rounded-lg ${debugOpen ? "bg-[#7c6fcd]/20 text-[#7c6fcd] hover:bg-[#7c6fcd]/30" : "text-white/40 hover:text-white/80 hover:bg-white/5"}`}>
+              <Bug className="w-3.5 h-3.5" /> Debug
+            </Button>
+            <DeployButton />
+          </div>
+        </header>
+        <div className="flex-1 min-h-0">
+          <ResizablePanelGroup direction="horizontal" className="h-full">
+            <ResizablePanel defaultSize={30} minSize={22} className="flex flex-col min-h-0">
+              <ResizablePanelGroup direction="vertical" className="h-full">
+                <ResizablePanel defaultSize={debugOpen ? 65 : 100} minSize={30} className="flex flex-col min-h-0">
+                  <div ref={containerRef} className="flex-1 overflow-y-auto py-4 space-y-2 px-2">
+                    {messages.length === 0 && <ProjectInfo />}
+                    {messages.map((message, i) => (
+                      <PreviewMessage key={message.id} message={message} isLoading={isLoading} status={status} isLatestMessage={i === messages.length - 1} />
+                    ))}
+                    <div ref={endRef} className="pb-2" />
+                  </div>
+                  {messages.length === 0 && (
+                    <PromptSuggestions disabled={isInitializing} submitPrompt={(p) => append({ role: "user", content: p })} />
+                  )}
+                  <div className="shrink-0 p-3 border-t border-white/[0.05] bg-[#0c0c14]">
+                    <form onSubmit={handleSubmit}>
+                      <Input handleInputChange={handleInputChange} input={input} isInitializing={isInitializing} isLoading={isLoading} status={status} stop={stop} />
+                    </form>
+                  </div>
+                </ResizablePanel>
+                {debugOpen && (
+                  <>
+                    <ResizableHandle withHandle />
+                    <ResizablePanel defaultSize={35} minSize={20} className="min-h-0">
+                      <DebugPanel />
+                    </ResizablePanel>
+                  </>
+                )}
+              </ResizablePanelGroup>
+            </ResizablePanel>
+            <ResizableHandle withHandle />
+            <ResizablePanel defaultSize={70} minSize={40} className="min-h-0">
+              <ResizablePanelGroup direction="vertical" className="h-full">
+                <ResizablePanel defaultSize={70} minSize={30} className="min-h-0">
+                  <VncPanel streamUrl={streamUrl} isInitializing={isInitializing} onRefresh={refreshDesktop} />
+                </ResizablePanel>
+                <ResizableHandle withHandle />
+                <ResizablePanel defaultSize={30} minSize={15} className="min-h-0 bg-[#0c0c14] border-t border-white/[0.05]">
+                  <ToolCallDetail event={selectedEvent} />
+                </ResizablePanel>
+              </ResizablePanelGroup>
+            </ResizablePanel>
+          </ResizablePanelGroup>
         </div>
       </div>
     </div>
   );
 }
+
+export default function Page() {
+  return (
+    <EventStoreProvider>
+      <Dashboard />
+    </EventStoreProvider>
+  );
+}
+

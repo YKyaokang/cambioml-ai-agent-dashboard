@@ -15,8 +15,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "AI SDK Computer Use Demo",
-  description: "A Next.js app that uses the AI SDK and Anthropic to create a computer using agent.",
+  title: "AI Agent Control Panel",
+  description: "Production-grade AI agent dashboard with VNC viewer, event pipeline, and multi-session management.",
 };
 
 export default function RootLayout({
