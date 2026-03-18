@@ -112,7 +112,7 @@ function Dashboard() {
       setMessages((prev) => [...prev.slice(0, -1), { ...lastMsg, parts: [...lastMsg.parts.slice(0, -1), { ...lastPart, toolInvocation: { ...lastPart.toolInvocation, state: "result", result: ABORTED } }] }]);
     }
   };
-
+  // 初始化vnc桌面
   const refreshDesktop = useCallback(async () => {
     try {
       setIsInitializing(true);
@@ -123,6 +123,7 @@ function Dashboard() {
     finally { setIsInitializing(false); }
   }, [updateActiveSessionSandboxId]);
 
+  //kill 相关
   useEffect(() => {
     const id = sandboxIdRef.current;
     if (!id) return;
